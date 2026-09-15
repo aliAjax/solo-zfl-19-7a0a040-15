@@ -588,6 +588,179 @@ function allocOf(req, batchNo) {
       );
     });
 
+    // ---------------- S8 入参反例（批次号跨类型判重 / 空请求体 / 非数字长度） ----------------
+    await step("S8 入参反例：明确 400 且不落任何记录", async () => {
+      const counts = async () => {
+        const d = JSON.parse(await readFile(server.dbFile, "utf8"));
+        return {
+          batches: d.paperBatches.length,
+          stockIns: d.stockIns.length,
+          requisitions: d.requisitions.length,
+          returns: d.materialReturns.length,
+          writeOffs: d.writeOffs.length,
+          adjustments: d.stockAdjustments.length
+        };
+      };
+      const before = await counts();
+      const balBefore = await batches(base);
+
+      // 8a 批次号跨类型判重：先字符串入库，再用数字、再用字符串都必须 409
+      const created = (
+        await ok(base, "POST", "/paper/batches", {
+          paperType: PAPER,
+          batchNo: "9001",
+          length: 4,
+          receivedAt: "2026-09-08T00:00:00.000Z"
+        })
+      ).data.batch;
+      check("字符串批次号 9001 入库成功", created.batchNo === "9001");
+      await fail(
+        base,
+        "POST",
+        "/paper/batches",
+        { paperType: PAPER, batchNo: 9001, length: 4 },
+        409
+      );
+      check("数字型批次号 9001 重复入库 → 409", true);
+      await fail(
+        base,
+        "POST",
+        "/paper/batches",
+        { paperType: PAPER, batchNo: "9001", length: 4 },
+        409
+      );
+      check("字符串批次号 9001 再次重复入库 → 409", true);
+      const dupList = (await ok(base, "GET", "/paper/batches?includeEmpty=true")).data.filter(
+        (b) => b.batchNo === "9001"
+      );
+      check("库存中同号批次只有一个，长度 4 不翻倍", dupList.length === 1 && approx(dupList[0].initialLength, 4), dupList);
+
+      // 8b 空值/非对象请求体必须 400，不能 500
+      for (const bad of [undefined, null, [], "oops", 42, true]) {
+        const res = await call(base, "POST", "/requisitions", bad);
+        assert.strictEqual(res.status, 400, `领料 body=${JSON.stringify(bad)} 期望400，实际${res.status}：${JSON.stringify(res.body)}`);
+      }
+      check("领料：无体/null/数组/字符串/数字/布尔 全部 400", true);
+      const resNullInbound = await call(base, "POST", "/paper/batches", null);
+      assert.strictEqual(resNullInbound.status, 400);
+      check("入库空体 400 而不是 500", true);
+
+      // 8c 分摊数组混入空值/非法值
+      await fail(
+        base,
+        "POST",
+        "/requisitions",
+        { tuneId: "tune_demo", paperType: PAPER, length: 1, allocations: "x" },
+        400
+      );
+      check("allocations 不是数组 → 400", true);
+      for (const badItems of [
+        [null],
+        [undefined],
+        ["x"],
+        [{}],
+        [{ batchId: created.id }],
+        [{ batchId: created.id, length: true }],
+        [{ batchId: 123, length: 1 }]
+      ]) {
+        const res = await call(base, "POST", "/requisitions", {
+          tuneId: "tune_demo",
+          paperType: PAPER,
+          length: 1,
+          allocations: badItems
+        });
+        assert.strictEqual(
+          res.status,
+          400,
+          `分摊 ${JSON.stringify(badItems)} 期望400，实际${res.status}：${JSON.stringify(res.body)}`
+        );
+      }
+      check("分摊项为 null/缺字段/布尔长度/非字符串batchId 全部 400", true);
+
+      // 8d 布尔等非数字长度一律拒绝（入库/领料/退料/核销/盘点）
+      for (const badLen of [true, false, "3", null, []]) {
+        const res = await call(base, "POST", "/paper/batches", {
+          paperType: PAPER_OTHER,
+          batchNo: `X-${String(badLen)}`,
+          length: badLen
+        });
+        assert.strictEqual(res.status, 400, `入库 length=${JSON.stringify(badLen)} 期望400，实际${res.status}`);
+      }
+      check("入库长度为布尔/字符串/null/数组 → 400", true);
+      await fail(base, "POST", "/requisitions", { tuneId: "tune_demo", paperType: PAPER, length: true }, 400);
+      check("领料长度为布尔真值 → 400（不会被当成 1 米）", true);
+      await fail(base, "POST", "/requisitions", { tuneId: "tune_demo", paperType: PAPER, length: "2" }, 400);
+      check("领料长度为数字字符串 → 400", true);
+
+      // 先正常领一张单（显式分摊到 9001 批次），再拿它打退料/核销反例——坏请求不能动这张单
+      const guardReq = (
+        await ok(base, "POST", "/requisitions", {
+          tuneId: "tune_demo",
+          paperType: PAPER,
+          length: 2,
+          reason: "S8 护栏单",
+          allocations: [{ batchId: created.id, length: 2 }]
+        })
+      ).data;
+      const guardBatchId = guardReq.allocations[0].batchId;
+      await fail(base, "POST", `/requisitions/${guardReq.id}/returns`, { length: true }, 400);
+      await fail(base, "POST", `/requisitions/${guardReq.id}/returns`, { length: "1" }, 400);
+      await fail(base, "POST", `/requisitions/${guardReq.id}/returns`, null, 400);
+      check("退料长度为布尔/字符串/空体 → 400", true);
+      await fail(
+        base,
+        "POST",
+        `/requisitions/${guardReq.id}/write-offs`,
+        { items: [{ batchId: guardBatchId, length: true }] },
+        400
+      );
+      await fail(base, "POST", `/requisitions/${guardReq.id}/write-offs`, { items: [null] }, 400);
+      await fail(base, "POST", `/requisitions/${guardReq.id}/write-offs`, { items: "x" }, 400);
+      check("核销长度布尔/空项/非数组 items → 400", true);
+      await fail(
+        base,
+        "POST",
+        "/stock-adjustments",
+        { batchId: guardBatchId, actualLength: true, reason: "布尔实测" },
+        400
+      );
+      check("盘点实际长度为布尔 → 400", true);
+
+      // 反例打完后：记录数只多了 1 个批次 + 1 张护栏领料单，其余不变；护栏单原封不动
+      const after = await counts();
+      check(
+        "反例没有写入多余批次/入库/退料/核销/盘点",
+        after.batches === before.batches + 1 &&
+          after.stockIns === before.stockIns + 1 &&
+          after.returns === before.returns &&
+          after.writeOffs === before.writeOffs &&
+          after.adjustments === before.adjustments,
+        { before, after }
+      );
+      check("反例没有写入多余领料单", after.requisitions === before.requisitions + 1, { before, after });
+
+      const guardAfter = (await ok(base, "GET", `/requisitions/${guardReq.id}`)).data;
+      check(
+        "护栏单没被坏退料/坏核销动过：仍 active、2 米未结",
+        guardAfter.status === "active" &&
+          approx(guardAfter.returnedLength, 0) &&
+          approx(guardAfter.writtenOffLength, 0) &&
+          approx(guardAfter.openLength, 2),
+        guardAfter
+      );
+      const balAfter = await batches(base);
+      check(
+        "坏请求后全部批次结余不变（9001 批次除外，它被护栏单显式扣过）",
+        Object.keys(balBefore).every((id) => approx(balBefore[id].availableLength, balAfter[id].availableLength))
+      );
+      const b9001 = balAfter[created.id];
+      check(
+        "9001 批次只被 2 米护栏单扣减：可用 2",
+        approx(b9001.initialLength, 4) && approx(b9001.availableLength, 2) && approx(b9001.issuedLength, 2),
+        b9001
+      );
+    });
+
     // ---------------- S7 SIGKILL 重启恢复 + tmp 清理 ----------------
     await step("S7 杀进程重启后账目一致，残留 tmp 被清理", async () => {
       const stockBefore = (await ok(base, "GET", "/paper/stock")).data;

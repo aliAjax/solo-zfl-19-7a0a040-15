@@ -203,11 +203,18 @@ async function parseBody(req) {
   let raw = "";
   for await (const chunk of req) raw += chunk;
   if (!raw) return {};
+  let parsed;
   try {
-    return JSON.parse(raw);
+    parsed = JSON.parse(raw);
   } catch {
     throw fail("请求体必须是合法JSON", 400);
   }
+  // null、数组、字符串、数字、布尔都不是合法请求体，必须明确报参数错误，
+  // 否则后面 required(body, ...) 会直接抛 TypeError 变成 500。
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw fail("请求体必须是 JSON 对象", 400);
+  }
+  return parsed;
 }
 
 function makeId(prefix) {
@@ -220,11 +227,27 @@ function required(body, fields) {
 }
 
 function parseLength(value, label, { allowZero = false } = {}) {
-  const num = Number(value);
-  if (!Number.isFinite(num) || num < 0 || (!allowZero && num <= 0)) {
+  // 严格数字类型：Boolean 会被 Number(true)=1 误收，数字字符串也不属于约定的数值字段，
+  // 这类入参一律按参数错误拒绝。
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw fail(`${label}必须是数字`, 400);
+  }
+  if (value < 0 || (!allowZero && value === 0)) {
     throw fail(allowZero ? `${label}必须是非负数` : `${label}必须是正数`, 400);
   }
-  return num;
+  return value;
+}
+
+function requireObject(value, label) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw fail(`${label}必须是对象`, 400);
+  }
+  return value;
+}
+
+function requireString(value, field) {
+  if (typeof value !== "string") throw fail(`字段 ${field} 必须是字符串`, 400);
+  return value;
 }
 
 function roundLength(num) {
@@ -345,7 +368,9 @@ function allocateExplicit(db, paperType, length, requested, stats) {
   const seen = new Set();
   const allocations = [];
   for (const item of requested) {
+    requireObject(item, "分摊项");
     required(item, ["batchId", "length"]);
+    requireString(item.batchId, "batchId");
     if (seen.has(item.batchId)) throw fail(`批次 ${item.batchId} 在分摊中重复`, 400);
     seen.add(item.batchId);
     const take = parseLength(item.length, "分摊长度");
@@ -573,16 +598,22 @@ async function handle(req, res) {
   if (req.method === "POST" && pathname === "/paper/batches") {
     const body = await parseBody(req);
     required(body, ["paperType", "batchNo", "length"]);
+    requireString(body.paperType, "paperType");
+    if (typeof body.batchNo !== "string" && typeof body.batchNo !== "number") {
+      throw fail("字段 batchNo 必须是字符串或数字", 400);
+    }
+    const batchNo = String(body.batchNo);
     const length = parseLength(body.length, "入库长度");
     const data = await withTransaction((db) => {
-      if (db.paperBatches.some((item) => item.batchNo === body.batchNo)) {
-        throw fail(`批次号 ${body.batchNo} 已存在`, 409);
+      // 判重一律按归一化后的字符串批次号，数字 9001 与 "9001" 不能重复入库
+      if (db.paperBatches.some((item) => item.batchNo === batchNo)) {
+        throw fail(`批次号 ${batchNo} 已存在`, 409);
       }
       const now = new Date().toISOString();
       const batch = {
         id: makeId("batch"),
         paperType: body.paperType,
-        batchNo: String(body.batchNo),
+        batchNo,
         initialLength: roundLength(length),
         supplier: body.supplier || "",
         note: body.note || "",
@@ -660,7 +691,12 @@ async function handle(req, res) {
   if (req.method === "POST" && pathname === "/requisitions") {
     const body = await parseBody(req);
     required(body, ["tuneId", "paperType", "length"]);
+    requireString(body.tuneId, "tuneId");
+    requireString(body.paperType, "paperType");
     const length = parseLength(body.length, "领料长度");
+    if (body.allocations !== undefined && !Array.isArray(body.allocations)) {
+      throw fail("字段 allocations 必须是数组", 400);
+    }
     const data = await withTransaction((db) => {
       findTune(db, body.tuneId); // 领料必须挂在真实曲目上
       const stats = computeBatchStats(db);
@@ -719,6 +755,7 @@ async function handle(req, res) {
     const body = await parseBody(req);
     required(body, ["length"]);
     const length = parseLength(body.length, "退料长度");
+    if (body.batchId !== undefined) requireString(body.batchId, "batchId");
     const data = await withTransaction((db) => {
       const requisition = findRequisition(db, requisitionId);
       if (requisition.status === "voided") throw fail("领料单已作废，不能再退料", 409);
@@ -784,13 +821,17 @@ async function handle(req, res) {
             length: roundLength(alloc.length - alloc.returnedLength - alloc.writtenOffLength)
           }))
           .filter((item) => item.length > LENGTH_EPS);
+      } else if (!Array.isArray(requested)) {
+        throw fail("字段 items 必须是数组", 400);
       }
-      if (!Array.isArray(requested) || !requested.length) throw fail("没有可核销的长度", 400);
+      if (!requested.length) throw fail("没有可核销的长度", 400);
 
       const seen = new Set();
       const items = [];
       for (const item of requested) {
+        requireObject(item, "核销项");
         required(item, ["batchId", "length"]);
+        requireString(item.batchId, "batchId");
         if (seen.has(item.batchId)) throw fail(`批次 ${item.batchId} 的核销重复提交`, 400);
         seen.add(item.batchId);
         const take = parseLength(item.length, "核销长度");
@@ -877,7 +918,9 @@ async function handle(req, res) {
   if (req.method === "POST" && pathname === "/stock-adjustments") {
     const body = await parseBody(req);
     required(body, ["batchId", "actualLength", "reason"]);
-    if (!String(body.reason).trim()) throw fail("盘点调整必须写明原因", 400);
+    requireString(body.batchId, "batchId");
+    requireString(body.reason, "reason");
+    if (!body.reason.trim()) throw fail("盘点调整必须写明原因", 400);
     const actualLength = parseLength(body.actualLength, "盘点实际长度", { allowZero: true });
     const data = await withTransaction((db) => {
       const batch = findBatch(db, body.batchId);
