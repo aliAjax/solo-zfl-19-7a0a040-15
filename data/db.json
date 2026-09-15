@@ -1,0 +1,50 @@
+{
+  "tunes": [
+    {
+      "id": "tune_demo",
+      "title": "雨后圆舞曲",
+      "composer": "匿名",
+      "stripSpec": {
+        "widthMm": 70,
+        "scale": "20音",
+        "tempoBpm": 82,
+        "paperType": "半透明纸带"
+      },
+      "createdAt": "2026-06-16T00:00:00.000Z"
+    }
+  ],
+  "sections": [
+    {
+      "id": "section_demo_1",
+      "tuneId": "tune_demo",
+      "startBeat": 1,
+      "endBeat": 32,
+      "laneRange": "1-10",
+      "checked": true,
+      "note": "开头主题已试奏"
+    },
+    {
+      "id": "section_demo_2",
+      "tuneId": "tune_demo",
+      "startBeat": 33,
+      "endBeat": 64,
+      "laneRange": "4-18",
+      "checked": false,
+      "note": "副歌段等待校对"
+    }
+  ],
+  "issues": [
+    {
+      "id": "issue_demo",
+      "tuneId": "tune_demo",
+      "sectionId": "section_demo_2",
+      "type": "漏孔",
+      "beat": 41,
+      "lane": 12,
+      "description": "第41拍高音孔漏打",
+      "status": "open",
+      "createdAt": "2026-06-16T00:00:00.000Z",
+      "resolvedAt": null
+    }
+  ]
+}
